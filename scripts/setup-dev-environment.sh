@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() {
+  printf '[setup] %s\n' "$*"
+}
+
+fail() {
+  printf '[setup] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+trap 'fail "Script aborted on line ${LINENO}."' ERR
+
+REPO_ROOT=$(pwd)
+if [[ ! -f "${REPO_ROOT}/gradlew" ]]; then
+  fail "This script must be executed from the root of the Signal-Android repository."
+fi
+
+# Ensure we can install system dependencies.
+SUDO_CMD=()
+APT_GET_BASE=(apt-get)
+if [[ $(id -u) -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO_CMD=(sudo -E)
+    APT_GET_BASE=(sudo -E apt-get)
+  else
+    fail "This script requires root privileges or sudo access to install packages."
+  fi
+fi
+
+run_privileged() {
+  if [[ ${#SUDO_CMD[@]} -gt 0 ]]; then
+    "${SUDO_CMD[@]}" "$@"
+  else
+    "$@"
+  fi
+}
+
+export DEBIAN_FRONTEND=noninteractive
+
+install_apt_packages() {
+  local -a packages_to_check=("ca-certificates" "curl" "git" "unzip" "wget" "zip" "openjdk-17-jdk")
+  local -a missing_packages=()
+  for package in "${packages_to_check[@]}"; do
+    if ! dpkg -s "${package}" >/dev/null 2>&1; then
+      missing_packages+=("${package}")
+    fi
+  done
+
+  if [[ ${#missing_packages[@]} -gt 0 ]]; then
+    log "Installing required APT packages: ${missing_packages[*]}"
+    if [[ " ${missing_packages[*]} " == *" openjdk-17-jdk "* ]]; then
+      log "Preparing Java certificate directory for OpenJDK installation."
+      run_privileged mkdir -p /etc/ssl/certs/java
+      if [[ -L /etc/ssl/certs/java/cacerts ]]; then
+        run_privileged rm -f /etc/ssl/certs/java/cacerts
+      fi
+      run_privileged touch /etc/ssl/certs/java/cacerts
+    fi
+    "${APT_GET_BASE[@]}" update
+    "${APT_GET_BASE[@]}" install -y "${missing_packages[@]}"
+  else
+    log "All required APT packages are already installed."
+  fi
+}
+
+ensure_android_cmdline_tools() {
+  local android_sdk_root="$1"
+  local cmdline_version="10406996"
+  local download_url="https://dl.google.com/android/repository/commandlinetools-linux-${cmdline_version}_latest.zip"
+  local cmdline_tools_dir="${android_sdk_root}/cmdline-tools/latest"
+  local sdkmanager_bin="${cmdline_tools_dir}/bin/sdkmanager"
+
+  if [[ -x "${sdkmanager_bin}" ]]; then
+    log "Android command line tools already present."
+    return
+  fi
+
+  log "Downloading Android command line tools (${cmdline_version})."
+  local temp_dir
+  temp_dir=$(mktemp -d)
+  curl -fsSL -o "${temp_dir}/cmdline-tools.zip" "${download_url}"
+
+  mkdir -p "${android_sdk_root}/cmdline-tools"
+  unzip -q "${temp_dir}/cmdline-tools.zip" -d "${temp_dir}"
+  rm -rf "${cmdline_tools_dir}"
+  mv "${temp_dir}/cmdline-tools" "${cmdline_tools_dir}"
+  rm -rf "${temp_dir}"
+  log "Android command line tools installed."
+}
+
+install_android_packages() {
+  local android_sdk_root="$1"
+  local sdkmanager_bin="${android_sdk_root}/cmdline-tools/latest/bin/sdkmanager"
+  local -a packages=(
+    "platform-tools"
+    "platforms;android-35"
+    "build-tools;35.0.0"
+    "extras;google;m2repository"
+    "extras;android;m2repository"
+    "extras;google;google_play_services"
+    "ndk;28.0.13004108"
+    "cmake;3.22.1"
+  )
+
+  if [[ ! -x "${sdkmanager_bin}" ]]; then
+    fail "sdkmanager was not found at ${sdkmanager_bin}."
+  fi
+
+  yes | "${sdkmanager_bin}" --sdk_root="${android_sdk_root}" --update >/dev/null || true
+  yes | "${sdkmanager_bin}" --sdk_root="${android_sdk_root}" "${packages[@]}" || true
+  yes | "${sdkmanager_bin}" --sdk_root="${android_sdk_root}" --licenses >/dev/null || true
+  log "Android SDK components are installed and licenses accepted."
+}
+
+update_shell_configuration() {
+  local android_sdk_root="$1"
+  local ndk_version="$2"
+  local java_home="$3"
+  local bashrc_file="$HOME/.bashrc"
+
+  mkdir -p "${HOME}/.android"
+  touch "${HOME}/.android/repositories.cfg"
+
+  local ndk_home="${android_sdk_root}/ndk/${ndk_version}"
+
+  local env_block
+  env_block=$(cat <<EOF
+# >>> signal-android setup >>>
+export ANDROID_HOME=${android_sdk_root}
+export ANDROID_SDK_ROOT=${android_sdk_root}
+export ANDROID_NDK_HOME=${ndk_home}
+export ANDROID_NDK_ROOT=${ndk_home}
+export JAVA_HOME=${java_home}
+export PATH="\$PATH:${android_sdk_root}/cmdline-tools/latest/bin:${android_sdk_root}/platform-tools"
+# <<< signal-android setup <<<
+EOF
+)
+
+  if [[ -f "${bashrc_file}" ]]; then
+    # Remove any existing block we previously installed.
+    if grep -q "# >>> signal-android setup >>>" "${bashrc_file}"; then
+      sed -i '/# >>> signal-android setup >>>/,/# <<< signal-android setup <<</d' "${bashrc_file}"
+    fi
+  else
+    touch "${bashrc_file}"
+  fi
+
+  printf '\n%s\n' "${env_block}" >> "${bashrc_file}"
+  log "Updated ${bashrc_file} with Android and Java environment variables."
+}
+
+update_local_properties() {
+  local android_sdk_root="$1"
+  local ndk_version="$2"
+  local local_properties_file="${REPO_ROOT}/local.properties"
+  local ndk_home="${android_sdk_root}/ndk/${ndk_version}"
+
+  {
+    printf '# Automatically generated by scripts/setup-dev-environment.sh\n'
+    printf 'sdk.dir=%s\n' "${android_sdk_root}"
+    if [[ -d "${ndk_home}" ]]; then
+      printf 'ndk.dir=%s\n' "${ndk_home}"
+    fi
+  } > "${local_properties_file}"
+
+  log "Wrote Android SDK configuration to ${local_properties_file}."
+}
+
+install_apt_packages
+
+JAVA_HOME=$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")
+export JAVA_HOME
+log "Using JAVA_HOME=${JAVA_HOME}"
+
+ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-${HOME}/android-sdk}"
+mkdir -p "${ANDROID_SDK_ROOT}"
+log "Using ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}"
+
+ensure_android_cmdline_tools "${ANDROID_SDK_ROOT}"
+export PATH="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${PATH}"
+
+ANDROID_NDK_VERSION="28.0.13004108"
+install_android_packages "${ANDROID_SDK_ROOT}"
+
+update_shell_configuration "${ANDROID_SDK_ROOT}" "${ANDROID_NDK_VERSION}" "${JAVA_HOME}"
+update_local_properties "${ANDROID_SDK_ROOT}" "${ANDROID_NDK_VERSION}"
+
+log "Development environment bootstrapping complete."
